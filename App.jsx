@@ -24,6 +24,10 @@ import {
   Sparkles,
   SkipForward,
   Zap,
+  Download,
+  FileSpreadsheet,
+  FileText,
+  FileJson,
 } from "lucide-react";
 
 /* ============================ CONSTANTS ============================ */
@@ -227,6 +231,32 @@ function extractCounterparty(desc) {
   // First long token
   const tokens = desc.split(/[\/\-\s]+/).filter((t) => t.length > 3 && !/^\d+$/.test(t));
   return cleanName(tokens[0] || desc).slice(0, 28);
+}
+
+/* CSV export helpers */
+function csvEscape(v) {
+  if (v == null) return "";
+  const s = String(v);
+  if (s.includes(",") || s.includes('"') || s.includes("\n") || s.includes("\r")) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+function downloadBlob(filename, content, mime) {
+  const blob = new Blob([content], { type: mime + ";charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function rowsToCSV(rows) {
+  return rows.map((r) => r.map(csvEscape).join(",")).join("\n");
 }
 
 function cleanName(s) {
@@ -603,6 +633,18 @@ function ActionCenter({ queue, total, current, onClear, onSkip, onApplyRule }) {
   );
 }
 
+function relativeTime(ts) {
+  if (!ts) return "";
+  const diff = Date.now() - ts;
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
+}
+
 function InsightsBlock({ report, refreshing, onRefresh }) {
   if (!report) {
     return (
@@ -620,7 +662,12 @@ function InsightsBlock({ report, refreshing, onRefresh }) {
   return (
     <div className="insights-panel">
       <div className="insights-top">
-        <div className="insights-header">Intelligence Report</div>
+        <div>
+          <div className="insights-header">Intelligence Report</div>
+          {report._updatedAt && (
+            <div className="insights-timestamp">Updated {relativeTime(report._updatedAt)} · saved locally</div>
+          )}
+        </div>
         <button className="btn-ghost sm dark" onClick={onRefresh} disabled={refreshing}>
           <RefreshCw size={12} className={refreshing ? "spin" : ""} /> Refresh
         </button>
@@ -755,6 +802,148 @@ function Toast({ message, onClose }) {
     return () => clearTimeout(t);
   }, [onClose]);
   return <div className="toast">{message}</div>;
+}
+
+function ExportMenu({ transactions, categorizations, cleared, rules, report, stats }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  const exportTransactions = () => {
+    const header = [
+      "date", "source", "type", "amount", "balance",
+      "description", "counterparty", "category", "confidence",
+      "ai_hypothesis", "user_confirmed", "cleared",
+    ];
+    const rows = [header];
+    transactions.forEach((t) => {
+      const c = categorizations[t.id] || {};
+      rows.push([
+        t.date,
+        t.source,
+        t.type,
+        t.amount,
+        t.balance ?? "",
+        t.description,
+        extractCounterparty(t.description),
+        c.category || "",
+        c.confidence != null ? c.confidence.toFixed(2) : "",
+        c.hypothesis || "",
+        c.userOverride ? "yes" : "no",
+        cleared[t.id] ? (cleared[t.id] === "skipped" ? "skipped" : "yes") : "no",
+      ]);
+    });
+    downloadBlob(`clearwater-transactions-${todayStr}.csv`, rowsToCSV(rows), "text/csv");
+    setOpen(false);
+  };
+
+  const exportCategories = () => {
+    const header = ["category", "total_amount", "transaction_count", "percentage_of_spend"];
+    const rows = [header];
+    const totalSpend = stats.categoryBreakdown.reduce((a, b) => a + b.amount, 0) || 1;
+    stats.categoryBreakdown.forEach((c) => {
+      const count = transactions.filter(
+        (t) => t.type === "debit" && (categorizations[t.id]?.category === c.name)
+      ).length;
+      rows.push([
+        c.name,
+        c.amount.toFixed(2),
+        count,
+        ((c.amount / totalSpend) * 100).toFixed(1) + "%",
+      ]);
+    });
+    downloadBlob(`clearwater-categories-${todayStr}.csv`, rowsToCSV(rows), "text/csv");
+    setOpen(false);
+  };
+
+  const exportInsights = () => {
+    if (!report) return;
+    const rows = [["section", "category_or_flag", "detail", "priority"]];
+    rows.push(["Spend Pulse", "", report.spendPulse || "", ""]);
+    rows.push(["Category Watch", "", report.categoryWatch || "", ""]);
+    (report.spendLess || []).forEach((it) => rows.push(["Spend Less", it.category, it.observation, ""]));
+    (report.spendMore || []).forEach((it) => rows.push(["Spend More", it.category, it.observation, ""]));
+    (report.watchOut || []).forEach((it) => rows.push(["Watch Out", it.flag, it.detail, ""]));
+    (report.actionSteps || []).forEach((it) => rows.push(["Action Step", it.title, it.rationale, it.priority]));
+    downloadBlob(`clearwater-insights-${todayStr}.csv`, rowsToCSV(rows), "text/csv");
+    setOpen(false);
+  };
+
+  const exportAll = () => {
+    const backup = {
+      exportedAt: new Date().toISOString(),
+      transactions,
+      categorizations,
+      cleared,
+      rules,
+      report,
+      stats: {
+        netWorth: stats.netWorth,
+        totalIn: stats.totalIn,
+        totalOut: stats.totalOut,
+        confidence: stats.confidence,
+        topCategory: stats.topCategory,
+        categoryBreakdown: stats.categoryBreakdown,
+      },
+    };
+    downloadBlob(
+      `clearwater-backup-${todayStr}.json`,
+      JSON.stringify(backup, null, 2),
+      "application/json"
+    );
+    setOpen(false);
+  };
+
+  return (
+    <div className="export-menu-wrap" ref={ref}>
+      <button className="btn-ghost sm" onClick={() => setOpen((v) => !v)}>
+        <Download size={14} /> Export
+      </button>
+      {open && (
+        <div className="export-menu">
+          <button className="export-item" onClick={exportTransactions}>
+            <FileSpreadsheet size={14} />
+            <div>
+              <div className="export-item-title">All Transactions</div>
+              <div className="export-item-sub">CSV · opens in Excel / Google Sheets</div>
+            </div>
+          </button>
+          <button className="export-item" onClick={exportCategories}>
+            <FileSpreadsheet size={14} />
+            <div>
+              <div className="export-item-title">Categories Summary</div>
+              <div className="export-item-sub">CSV · spend by category</div>
+            </div>
+          </button>
+          <button className="export-item" onClick={exportInsights} disabled={!report}>
+            <FileText size={14} />
+            <div>
+              <div className="export-item-title">Insights Report</div>
+              <div className="export-item-sub">CSV · all AI observations and action steps</div>
+            </div>
+          </button>
+          <div className="export-divider" />
+          <button className="export-item" onClick={exportAll}>
+            <FileJson size={14} />
+            <div>
+              <div className="export-item-title">Full Backup</div>
+              <div className="export-item-sub">JSON · everything, including rules</div>
+            </div>
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 /* ============================ APP ============================ */
@@ -1042,6 +1231,24 @@ export default function App() {
     if (!txns || txns.length === 0) return;
     setRefreshing(true);
     try {
+      // Compute netWorth inline from passed txns (don't trust closure-captured stats)
+      const bySource = {};
+      txns.forEach((t) => {
+        if (!bySource[t.source]) bySource[t.source] = [];
+        bySource[t.source].push(t);
+      });
+      let netWorthEstimate = 0;
+      Object.entries(bySource).forEach(([, ts]) => {
+        const sorted = [...ts].sort((a, b) => a.date.localeCompare(b.date));
+        const lastWithBalance = [...sorted].reverse().find((t) => t.balance != null);
+        if (lastWithBalance) netWorthEstimate += lastWithBalance.balance;
+        else {
+          const cr = ts.filter((t) => t.type === "credit").reduce((a, b) => a + b.amount, 0);
+          const dr = ts.filter((t) => t.type === "debit").reduce((a, b) => a + b.amount, 0);
+          netWorthEstimate += cr - dr;
+        }
+      });
+
       const payload = txns.slice(0, 300).map((t) => ({
         date: t.date,
         amount: t.amount,
@@ -1051,11 +1258,14 @@ export default function App() {
       }));
       const res = await callClaude(
         REPORT_SYSTEM,
-        `TRANSACTIONS: ${JSON.stringify(payload)}\nNET_WORTH_ESTIMATE: ${stats.netWorth}`,
+        `TRANSACTIONS: ${JSON.stringify(payload)}\nNET_WORTH_ESTIMATE: ${netWorthEstimate}`,
         3000
       );
       const parsed = safeParseJSON(res);
-      if (parsed) setReport(parsed);
+      if (parsed) {
+        parsed._updatedAt = Date.now();
+        setReport(parsed);
+      }
     } catch (err) {
       console.error("Report failed", err);
     }
@@ -1087,7 +1297,17 @@ export default function App() {
         </div>
         <div className="top-right">
           {hasData && (
-            <button className="btn-ghost sm" onClick={handleReset}>Reset</button>
+            <>
+              <ExportMenu
+                transactions={transactions}
+                categorizations={categorizations}
+                cleared={cleared}
+                rules={rules}
+                report={report}
+                stats={stats}
+              />
+              <button className="btn-ghost sm" onClick={handleReset}>Reset</button>
+            </>
           )}
           <button className="btn-primary sm" onClick={() => setUploadOpen(true)}>
             <Upload size={14} /> Upload
@@ -1774,6 +1994,50 @@ body { margin: 0; }
   margin-bottom: 4px;
 }
 .proc-msg { font-size: 13px; color: var(--text-secondary); }
+
+/* EXPORT MENU */
+.export-menu-wrap { position: relative; }
+.export-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-elevated);
+  padding: 6px;
+  min-width: 280px;
+  z-index: 50;
+  animation: fadeUp 180ms ease;
+}
+.export-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  color: var(--text-primary);
+  transition: background 120ms;
+}
+.export-item:hover:not(:disabled) { background: var(--bg-elevated); }
+.export-item:disabled { opacity: 0.4; cursor: not-allowed; }
+.export-item svg { color: var(--accent-primary); flex-shrink: 0; }
+.export-item-title { font-size: 13px; font-weight: 500; }
+.export-item-sub { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
+.export-divider { height: 1px; background: var(--border); margin: 4px 8px; }
+
+.insights-timestamp {
+  font-size: 11px;
+  color: var(--accent-soft);
+  margin-top: 4px;
+  opacity: 0.7;
+}
 
 /* TOAST */
 .toast {
