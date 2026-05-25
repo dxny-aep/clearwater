@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import {
   BarChart,
   Bar,
@@ -19,30 +19,53 @@ import {
   ArrowUp,
   AlertTriangle,
   RefreshCw,
-  Download,
   X,
+  Plus,
+  Sparkles,
+  SkipForward,
+  Zap,
 } from "lucide-react";
 
-/* ------------------------------------------------------------------ */
-/*  Constants & Utilities                                              */
-/* ------------------------------------------------------------------ */
+/* ============================ CONSTANTS ============================ */
 
 const SOURCE_COLORS = ["#93c5fd", "#6ee7b7", "#fca5a5", "#fcd34d", "#c4b5fd", "#f9a8d4"];
 const DEFAULT_SOURCES = [
-  { id: "s1", name: "Bank Account 1", file: null, color: SOURCE_COLORS[0], status: "empty" },
-  { id: "s2", name: "Bank Account 2", file: null, color: SOURCE_COLORS[1], status: "empty" },
-  { id: "s3", name: "Bank Account 3", file: null, color: SOURCE_COLORS[2], status: "empty" },
-  { id: "s4", name: "Bank Account 4", file: null, color: SOURCE_COLORS[3], status: "empty" },
-  { id: "s5", name: "Robo Advisor", file: null, color: SOURCE_COLORS[4], status: "empty" },
-  { id: "s6", name: "Angel One", file: null, color: SOURCE_COLORS[5], status: "empty" },
+  { id: "s1", name: "Bank Account 1", color: SOURCE_COLORS[0] },
+  { id: "s2", name: "Bank Account 2", color: SOURCE_COLORS[1] },
+  { id: "s3", name: "Bank Account 3", color: SOURCE_COLORS[2] },
+  { id: "s4", name: "Bank Account 4", color: SOURCE_COLORS[3] },
+  { id: "s5", name: "Robo Advisor", color: SOURCE_COLORS[4] },
+  { id: "s6", name: "Angel One", color: SOURCE_COLORS[5] },
 ];
 
-const PROCESSING_MESSAGES = [
-  "Reading your statements...",
-  "Identifying transactions...",
-  "Calculating net worth...",
-  "Preparing your insights...",
+const CATEGORIES = [
+  "Food & Dining",
+  "Groceries",
+  "Transport",
+  "Utilities",
+  "Rent",
+  "EMI/Loan",
+  "Investment",
+  "Insurance",
+  "Shopping",
+  "Medical",
+  "Entertainment",
+  "Subscriptions",
+  "Transfer to Self",
+  "Income",
+  "Other",
 ];
+
+const LS_KEYS = {
+  txns: "cw_transactions_v2",
+  cats: "cw_categorizations_v2",
+  rules: "cw_rules_v2",
+  cleared: "cw_cleared_v2",
+  report: "cw_report_v2",
+  sources: "cw_sources_v2",
+};
+
+/* ============================ UTILITIES ============================ */
 
 function formatINR(amount) {
   if (amount == null || isNaN(amount)) return "₹0";
@@ -57,10 +80,8 @@ function formatINR(amount) {
 function parseDate(raw) {
   if (!raw) return null;
   const s = String(raw).trim();
-  // YYYY-MM-DD
   let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-  // DD/MM/YYYY or DD-MM-YYYY
   m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
   if (m) {
     const d = m[1].padStart(2, "0");
@@ -69,7 +90,6 @@ function parseDate(raw) {
     if (y.length === 2) y = "20" + y;
     return `${y}-${mo}-${d}`;
   }
-  // DD MMM YYYY
   m = s.match(/^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2,4})/);
   if (m) {
     const months = { jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06", jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12" };
@@ -112,7 +132,6 @@ function parseCSV(file, sourceName) {
       complete: (results) => {
         try {
           const rows = results.data;
-          // Find header row: row with most string cells that contain keywords
           let headerIdx = 0;
           for (let i = 0; i < Math.min(rows.length, 15); i++) {
             const joined = rows[i].join(" ").toLowerCase();
@@ -124,7 +143,7 @@ function parseCSV(file, sourceName) {
               break;
             }
           }
-          const headers = rows[headerIdx];
+          const headers = rows[headerIdx] || [];
           const cols = detectColumns(headers);
           const txns = [];
           for (let i = headerIdx + 1; i < rows.length; i++) {
@@ -159,6 +178,7 @@ function parseCSV(file, sourceName) {
             if (amount <= 0) continue;
             const balance = cols.balance >= 0 ? cleanNum(row[cols.balance]) : null;
             txns.push({
+              id: `${sourceName}-${date}-${i}-${Math.random().toString(36).slice(2, 7)}`,
               date,
               description: desc,
               amount,
@@ -185,15 +205,42 @@ async function extractPDFText(file) {
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    const pageText = content.items.map((it) => it.str).join(" ");
-    text += pageText + "\n";
+    text += content.items.map((it) => it.str).join(" ") + "\n";
   }
   return text;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Anthropic API wrapper                                              */
-/* ------------------------------------------------------------------ */
+/* Counterparty extraction — pull recognizable name from UPI/IMPS narration */
+function extractCounterparty(desc) {
+  if (!desc) return "Unknown";
+  const s = desc.toUpperCase();
+  // UPI: UPI/<refno>/<NAME>/<bank>/... or UPI-<name>-...
+  let m = s.match(/UPI[\/\-]([A-Z0-9]+)[\/\-]([A-Z0-9\s\.\&]+?)[\/\-]/);
+  if (m) return cleanName(m[2]);
+  m = s.match(/IMPS[\/\-][A-Z0-9]+[\/\-]([A-Z0-9\s\.\&]+?)[\/\-]/);
+  if (m) return cleanName(m[1]);
+  m = s.match(/(?:NEFT|RTGS)[\/\-][A-Z0-9]+[\/\-]([A-Z0-9\s\.\&]+?)[\/\-]/);
+  if (m) return cleanName(m[1]);
+  // POS/Card: POS <merchant>
+  m = s.match(/(?:POS|ATM|VPS)\s+([A-Z0-9\s\.\&]+?)(?:\s{2,}|$)/);
+  if (m) return cleanName(m[1]);
+  // First long token
+  const tokens = desc.split(/[\/\-\s]+/).filter((t) => t.length > 3 && !/^\d+$/.test(t));
+  return cleanName(tokens[0] || desc).slice(0, 28);
+}
+
+function cleanName(s) {
+  return String(s || "")
+    .replace(/[^A-Za-z0-9\s\&\.]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .map((w) => (w.length > 2 ? w.charAt(0) + w.slice(1).toLowerCase() : w))
+    .join(" ")
+    .slice(0, 28);
+}
+
+/* ============================ ANTHROPIC ============================ */
 
 async function callClaude(systemPrompt, userMessage, maxTokens = 1000) {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -235,328 +282,70 @@ function safeParseJSON(text) {
 }
 
 const PARSE_PDF_SYSTEM = `You are a financial data parser. The user will give you raw text extracted from an Indian bank or investment statement PDF.
-Your job is to extract all transactions and return them as a JSON array.
+Extract all transactions and return them as a JSON array.
 Return ONLY valid JSON, no explanation, no markdown fences.
-Each transaction object must have exactly these fields:
-{ "date": "YYYY-MM-DD", "description": "string", "amount": number (always positive), "type": "debit" or "credit", "balance": number or null }
-If a field cannot be determined, use null. Parse all dates to YYYY-MM-DD format.
-Handle Indian date formats like DD/MM/YYYY, DD-MM-YYYY, DD MMM YYYY.
-If amount sign is ambiguous, use context clues (Dr/Cr labels, column position).`;
+Each object: { "date": "YYYY-MM-DD", "description": "string", "amount": number (positive), "type": "debit" or "credit", "balance": number or null }
+Handle DD/MM/YYYY, DD-MM-YYYY, DD MMM YYYY formats. Use Dr/Cr labels for type when present.`;
 
-const CLARIFY_SYSTEM = `You are a personal finance assistant analyzing Indian bank and investment statements.
-You will receive a list of financial transactions. Your job is to identify transactions that are ambiguous — where the category or purpose is unclear from the description alone.
-Return ONLY a JSON array of question objects, no explanation, no markdown.
-Limit to maximum 10 questions. Pick the most impactful ambiguous transactions (largest amounts first).
-Each object: { "transactionIndex": number, "question": "string", "options": ["string", "string", ...] }
-Options should be 4–6 relevant categories. Always include "Transfer to Self" and "Other" as last two options.
-Common Indian categories: Food & Dining, Groceries, Utilities, Rent, EMI/Loan, Investment, Insurance, Shopping, Medical, Entertainment, Transfer to Self, Other.`;
+const BULK_CAT_SYSTEM = `You are categorizing Indian bank/investment transactions.
+Return ONLY a JSON array. One object per transaction in the SAME order as input.
+Each object: { "category": "string", "confidence": 0.0-1.0, "hypothesis": "short reason (max 12 words)", "chips": ["3-4 likely categories"] }
+Available categories: ${CATEGORIES.join(", ")}.
+Confidence rules:
+- 0.9+ = description very clearly indicates merchant/purpose (e.g. "SWIGGY", "ELECTRICITY BILL")
+- 0.6-0.8 = recognizable but ambiguous merchant
+- 0.3-0.5 = generic UPI/transfer with no clue
+- below 0.3 = pure noise (random reference numbers)
+"chips" should rank the 3-4 most plausible categories for this txn (most likely first). Always include the chosen "category" as the first chip.
+Be terse. Hypothesis examples: "Swiggy food delivery", "Looks like P2P transfer", "Electricity utility bill".`;
 
 const REPORT_SYSTEM = `You are a sharp, direct personal finance advisor for an Indian user.
-You receive structured financial data from multiple bank accounts and investment platforms.
-Analyze the data and return a comprehensive report as a single JSON object.
-Return ONLY valid JSON, no explanation, no markdown fences.
-JSON structure:
+You receive categorized financial data. Return a JSON object only, no markdown.
 {
-  "netWorth": {
-    "total": number,
-    "bankTotal": number,
-    "investmentTotal": number,
-    "breakdown": [{ "source": "string", "value": number }]
-  },
-  "cashFlow": {
-    "totalIn": number,
-    "totalOut": number,
-    "weeklySpend": [{ "week": "string", "amount": number }],
-    "spendPulse": "string (2 sentences, direct, no fluff)"
-  },
-  "categories": [
-    { "name": "string", "amount": number, "percentage": number }
-  ],
-  "categoryWatch": "string (1 sentence flagging one category)",
-  "spendLess": [
-    { "category": "string", "observation": "string (1 sentence)" }
-  ],
-  "spendMore": [
-    { "category": "string", "observation": "string (1 sentence)" }
-  ],
-  "watchOut": [
-    { "flag": "string", "detail": "string (1 sentence)" }
-  ],
-  "actionSteps": [
-    { "title": "string", "rationale": "string (1 sentence)", "priority": "URGENT" | "THIS WEEK" | "THIS MONTH" }
-  ]
+  "spendPulse": "2 sentences, direct, reference specific numbers",
+  "categoryWatch": "1 sentence flagging one category",
+  "spendLess": [{ "category": "string", "observation": "1 sentence with specific amount" }],
+  "spendMore": [{ "category": "string", "observation": "1 sentence" }],
+  "watchOut": [{ "flag": "string", "detail": "1 sentence" }],
+  "actionSteps": [{ "title": "string", "rationale": "1 sentence", "priority": "URGENT" | "THIS WEEK" | "THIS MONTH" }]
 }
-Rules:
-- actionSteps: exactly 5, ordered by urgency
-- spendLess: 2–3 items
-- spendMore: 1–2 items
-- watchOut: 1–3 items
-- All amounts in INR, as raw numbers (no formatting)
-- Be specific and direct. Reference actual numbers from the data. No generic advice.
-- Assume the user is a young Indian professional who wants honest, actionable feedback.`;
+Rules: spendLess 2-3, spendMore 1-2, watchOut 1-3, actionSteps exactly 5 ordered by urgency.
+Be specific. Cite real numbers. No generic advice. Young Indian professional audience.`;
 
-/* ------------------------------------------------------------------ */
-/*  Sub-components                                                     */
-/* ------------------------------------------------------------------ */
+/* ============================ HOOKS ============================ */
 
-function SourceSlot({ source, onFileSelect, onRename }) {
-  const inputRef = useRef(null);
-  const [dragOver, setDragOver] = useState(false);
-  const [editing, setEditing] = useState(false);
-  const [name, setName] = useState(source.name);
-
-  const handleDrop = (e) => {
-    e.preventDefault();
-    setDragOver(false);
-    const f = e.dataTransfer.files[0];
-    if (f) onFileSelect(f);
-  };
-
-  return (
-    <div
-      className={`source-slot ${dragOver ? "drag-over" : ""}`}
-      onDragOver={(e) => {
-        e.preventDefault();
-        setDragOver(true);
-      }}
-      onDragLeave={() => setDragOver(false)}
-      onDrop={handleDrop}
-    >
-      <div className="dot" style={{ background: source.color }} />
-      <div className="slot-center">
-        {editing ? (
-          <input
-            autoFocus
-            className="rename-input"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            onBlur={() => {
-              setEditing(false);
-              if (name.trim()) onRename(name.trim());
-              else setName(source.name);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") e.currentTarget.blur();
-            }}
-          />
-        ) : (
-          <div className="slot-name" onClick={() => setEditing(true)}>
-            {source.name}
-          </div>
-        )}
-        <div className="slot-hint">
-          {source.file
-            ? `${source.file.name} · ${(source.file.size / 1024).toFixed(1)} KB`
-            : "CSV or PDF"}
-        </div>
-      </div>
-      <div className="slot-right">
-        {source.file ? (
-          <div className="check-icon">
-            <Check size={14} strokeWidth={3} />
-          </div>
-        ) : (
-          <button
-            className="btn-ghost"
-            onClick={() => inputRef.current?.click()}
-            type="button"
-          >
-            <Upload size={14} /> Upload
-          </button>
-        )}
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".csv,.pdf"
-          style={{ display: "none" }}
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) onFileSelect(f);
-          }}
-        />
-      </div>
-    </div>
-  );
-}
-
-function UploadScreen({ sources, onFileSelect, onRename, onAnalyze, error }) {
-  const hasFile = sources.some((s) => s.file);
-  return (
-    <div className="upload-screen fade-up">
-      <div className="brand">
-        <div className="brand-name">Clearwater</div>
-        <div className="brand-tagline">Your complete financial picture.</div>
-        <div className="brand-rule" />
-      </div>
-      <div className="source-list">
-        {sources.map((s, i) => (
-          <div key={s.id} className="fade-up" style={{ animationDelay: `${i * 60}ms` }}>
-            <SourceSlot
-              source={s}
-              onFileSelect={(f) => onFileSelect(s.id, f)}
-              onRename={(n) => onRename(s.id, n)}
-            />
-          </div>
-        ))}
-      </div>
-      {error && <div className="error-card">{error}</div>}
-      <button
-        className="btn-primary btn-block"
-        disabled={!hasFile}
-        onClick={onAnalyze}
-      >
-        Analyze My Finances <ArrowRight size={16} />
-      </button>
-      <div className="upload-foot">
-        All processing happens in your browser. Nothing is stored.
-      </div>
-    </div>
-  );
-}
-
-function ProcessingScreen({ progress, message }) {
-  const radius = 70;
-  const circumference = 2 * Math.PI * radius;
-  const offset = circumference - (progress / 100) * circumference;
-  return (
-    <div className="processing-screen">
-      <div className="ring-wrap">
-        <svg width="180" height="180" viewBox="0 0 180 180">
-          <circle
-            cx="90"
-            cy="90"
-            r={radius}
-            fill="none"
-            stroke="rgba(147,197,253,0.15)"
-            strokeWidth="4"
-          />
-          <circle
-            cx="90"
-            cy="90"
-            r={radius}
-            fill="none"
-            stroke="#2563eb"
-            strokeWidth="4"
-            strokeLinecap="round"
-            strokeDasharray={circumference}
-            strokeDashoffset={offset}
-            style={{ transition: "stroke-dashoffset 400ms ease", transform: "rotate(-90deg)", transformOrigin: "center" }}
-          />
-        </svg>
-        <div className="ring-pct">{Math.round(progress)}%</div>
-      </div>
-      <div className="proc-message">{message}</div>
-    </div>
-  );
-}
-
-function ClarifyScreen({ questions, transactions, answers, current, onAnswer, onSkip, onPrev, onGenerate }) {
-  const q = questions[current];
-  const txn = q ? transactions[q.transactionIndex] : null;
-  const [otherText, setOtherText] = useState("");
-  const [showOther, setShowOther] = useState(false);
+function useLocalStorage(key, initial) {
+  const [val, setVal] = useState(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw == null) return initial;
+      return JSON.parse(raw);
+    } catch {
+      return initial;
+    }
+  });
   useEffect(() => {
-    setOtherText("");
-    setShowOther(false);
-  }, [current]);
-  if (!q || !txn) return null;
-  const isLast = current === questions.length - 1;
-  const progressPct = ((current + 1) / questions.length) * 100;
-
-  return (
-    <div className="clarify-screen fade-up">
-      <div className="clarify-progress">
-        <div className="clarify-progress-fill" style={{ width: `${progressPct}%` }} />
-      </div>
-      <div className="brand-name" style={{ fontSize: 24 }}>Quick Questions</div>
-      <div className="brand-tagline">Help me understand a few transactions</div>
-      <div className="brand-rule" />
-
-      <div key={current} className="question-card slide-in">
-        <div className="txn-strip">
-          <div>
-            <div className="txn-date">{txn.date}</div>
-            <div className="txn-source">{txn.source}</div>
-          </div>
-          <div className={`txn-amount ${txn.type === "debit" ? "debit" : "credit"}`}>
-            {txn.type === "debit" ? "−" : "+"}{formatINR(txn.amount)}
-          </div>
-        </div>
-        <div className="txn-desc">{txn.description || "—"}</div>
-        <div className="question-text">{q.question}</div>
-        <div className="chip-wrap">
-          {q.options.map((opt) => (
-            <button
-              key={opt}
-              className="chip"
-              onClick={() => onAnswer(opt)}
-            >
-              {opt}
-            </button>
-          ))}
-          <button
-            className="chip"
-            onClick={() => setShowOther((v) => !v)}
-          >
-            Something else
-          </button>
-        </div>
-        {showOther && (
-          <div className="other-input-wrap">
-            <input
-              className="other-input"
-              placeholder="Type your answer..."
-              value={otherText}
-              onChange={(e) => setOtherText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && otherText.trim()) onAnswer(otherText.trim());
-              }}
-            />
-            <button
-              className="btn-ghost"
-              disabled={!otherText.trim()}
-              onClick={() => onAnswer(otherText.trim())}
-            >
-              Save
-            </button>
-          </div>
-        )}
-        <div className="clarify-nav">
-          <button className="link-btn" onClick={onPrev} disabled={current === 0}>
-            ← Back
-          </button>
-          <button className="link-btn" onClick={onSkip}>
-            Skip
-          </button>
-        </div>
-      </div>
-
-      {answers.filter((a) => a !== null).length === questions.length && (
-        <button className="btn-primary btn-block" onClick={onGenerate}>
-          Generate Report <ArrowRight size={16} />
-        </button>
-      )}
-      {current === questions.length - 1 && (
-        <button className="btn-primary btn-block" onClick={onGenerate} style={{ marginTop: 16 }}>
-          Generate Report <ArrowRight size={16} />
-        </button>
-      )}
-    </div>
-  );
+    try {
+      localStorage.setItem(key, JSON.stringify(val));
+    } catch {}
+  }, [key, val]);
+  return [val, setVal];
 }
 
-function useCountUp(target, duration = 1200) {
-  const [val, setVal] = useState(0);
+function useCountUp(target, duration = 900) {
+  const [val, setVal] = useState(target || 0);
+  const prev = useRef(target || 0);
   useEffect(() => {
     let raf;
     const start = performance.now();
-    const initial = 0;
+    const from = prev.current;
+    const to = target || 0;
     const step = (t) => {
-      const elapsed = t - start;
-      const p = Math.min(1, elapsed / duration);
+      const p = Math.min(1, (t - start) / duration);
       const eased = 1 - Math.pow(1 - p, 3);
-      setVal(initial + (target - initial) * eased);
+      setVal(from + (to - from) * eased);
       if (p < 1) raf = requestAnimationFrame(step);
+      else prev.current = to;
     };
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
@@ -564,191 +353,281 @@ function useCountUp(target, duration = 1200) {
   return val;
 }
 
-function NetWorthCard({ data }) {
-  const counted = useCountUp(data?.total || 0);
-  const breakdown = (data?.breakdown || []).filter((b) => b.value > 0);
-  const chartData = breakdown.length
-    ? [breakdown.reduce((acc, b) => ({ ...acc, [b.source]: b.value }), { name: "Net Worth" })]
-    : [];
-  const colors = SOURCE_COLORS;
+/* ============================ COMPONENTS ============================ */
+
+function UploadModal({ open, onClose, sources, onParse, processing, progress, message }) {
+  const inputRefs = useRef({});
+  const [stagedFiles, setStagedFiles] = useState({});
+
+  useEffect(() => {
+    if (!open) setStagedFiles({});
+  }, [open]);
+
+  if (!open) return null;
+
+  const hasAny = Object.values(stagedFiles).some(Boolean);
+
   return (
-    <div className="card networth-card">
-      <div className="networth-left">
-        <div className="card-label">Net Worth</div>
-        <div className="big-number">{formatINR(counted)}</div>
-        <div className="sub-text">First analysis</div>
-      </div>
-      <div className="networth-right">
-        <div className="legend-grid">
-          {breakdown.map((b, i) => (
-            <div key={b.source} className="legend-row">
-              <div className="dot-sm" style={{ background: colors[i % colors.length] }} />
-              <div className="legend-name">{b.source}</div>
-              <div className="legend-val">{formatINR(b.value)}</div>
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <div className="brand-name" style={{ fontSize: 22 }}>Upload Statements</div>
+            <div className="brand-tagline">CSV or PDF · up to 6 sources</div>
+          </div>
+          <button className="icon-btn" onClick={onClose}><X size={18} /></button>
+        </div>
+
+        {processing ? (
+          <div className="modal-processing">
+            <div className="proc-ring-sm">
+              <svg width="56" height="56" viewBox="0 0 56 56">
+                <circle cx="28" cy="28" r="22" fill="none" stroke="var(--accent-muted)" strokeWidth="3" />
+                <circle
+                  cx="28" cy="28" r="22"
+                  fill="none" stroke="var(--accent-primary)" strokeWidth="3"
+                  strokeLinecap="round"
+                  strokeDasharray={2 * Math.PI * 22}
+                  strokeDashoffset={2 * Math.PI * 22 * (1 - progress / 100)}
+                  style={{ transition: "stroke-dashoffset 300ms", transform: "rotate(-90deg)", transformOrigin: "center" }}
+                />
+              </svg>
             </div>
+            <div className="proc-pct">{Math.round(progress)}%</div>
+            <div className="proc-msg">{message}</div>
+          </div>
+        ) : (
+          <>
+            <div className="modal-list">
+              {sources.map((s) => (
+                <div key={s.id} className="source-slot compact">
+                  <div className="dot" style={{ background: s.color }} />
+                  <div className="slot-center">
+                    <div className="slot-name">{s.name}</div>
+                    <div className="slot-hint">
+                      {stagedFiles[s.id]
+                        ? `${stagedFiles[s.id].name} · ${(stagedFiles[s.id].size / 1024).toFixed(1)} KB`
+                        : "CSV or PDF"}
+                    </div>
+                  </div>
+                  <div className="slot-right">
+                    {stagedFiles[s.id] ? (
+                      <div className="check-icon"><Check size={14} strokeWidth={3} /></div>
+                    ) : (
+                      <button className="btn-ghost sm" onClick={() => inputRefs.current[s.id]?.click()}>
+                        <Upload size={12} /> Choose
+                      </button>
+                    )}
+                    <input
+                      ref={(el) => (inputRefs.current[s.id] = el)}
+                      type="file"
+                      accept=".csv,.pdf"
+                      style={{ display: "none" }}
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) setStagedFiles((prev) => ({ ...prev, [s.id]: f }));
+                      }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+            <button
+              className="btn-primary btn-block"
+              disabled={!hasAny}
+              onClick={() => onParse(stagedFiles)}
+            >
+              <Sparkles size={14} /> Parse & Categorize
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EmptyState({ onUpload }) {
+  return (
+    <div className="empty-state fade-up">
+      <div className="empty-icon">
+        <Sparkles size={32} />
+      </div>
+      <div className="empty-title">Welcome to Clearwater</div>
+      <div className="empty-sub">Upload your bank and investment statements to see your complete financial picture.</div>
+      <button className="btn-primary" onClick={onUpload}>
+        <Upload size={14} /> Upload Statements
+      </button>
+      <div className="empty-foot">All processing happens in your browser. Nothing is stored on a server.</div>
+    </div>
+  );
+}
+
+function StatsStrip({ stats }) {
+  const nw = useCountUp(stats.netWorth);
+  return (
+    <div className="stats-strip">
+      <div className="stat-block">
+        <div className="stat-label">Net Worth</div>
+        <div className="stat-value display">{formatINR(nw)}</div>
+      </div>
+      <div className="stat-divider" />
+      <div className="stat-block">
+        <div className="stat-label">This Month In</div>
+        <div className="stat-value">{formatINR(stats.totalIn)}</div>
+      </div>
+      <div className="stat-divider" />
+      <div className="stat-block">
+        <div className="stat-label">This Month Out</div>
+        <div className="stat-value">{formatINR(stats.totalOut)}</div>
+      </div>
+      <div className="stat-divider" />
+      <div className="stat-block">
+        <div className="stat-label">Top Category</div>
+        <div className="stat-value sm">{stats.topCategory || "—"}</div>
+        <div className="stat-sub">{stats.topCategory ? formatINR(stats.topCategoryAmount) : ""}</div>
+      </div>
+      <div className="stat-divider" />
+      <div className="stat-block">
+        <div className="stat-label">Confidence</div>
+        <div className="stat-value">{Math.round(stats.confidence * 100)}%</div>
+        <div className="confidence-bar">
+          <div className="confidence-fill" style={{ width: `${stats.confidence * 100}%` }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ActionCenter({ queue, total, current, onClear, onSkip, onApplyRule }) {
+  const [customInput, setCustomInput] = useState("");
+  const [showRule, setShowRule] = useState(false);
+  const item = queue[current];
+
+  useEffect(() => {
+    setCustomInput("");
+    setShowRule(false);
+  }, [current, item?.txn?.id]);
+
+  if (!item) {
+    return (
+      <div className="action-empty">
+        <div className="action-empty-icon"><Check size={28} /></div>
+        <div className="action-empty-title">You're all clear</div>
+        <div className="action-empty-sub">Every transaction has been categorized. Re-upload to add more.</div>
+      </div>
+    );
+  }
+
+  const { txn, cat } = item;
+  const counterparty = extractCounterparty(txn.description);
+  const dateLabel = new Date(txn.date).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+  const dayLabel = new Date(txn.date).toLocaleDateString("en-IN", { weekday: "long" });
+  const cleared = total - queue.length;
+
+  const submit = (category) => {
+    onClear(txn.id, category, showRule);
+  };
+
+  return (
+    <div className="action-card-wrap">
+      <div className="action-meta">
+        <div className="action-meta-left">
+          <Zap size={14} /> Action Center
+        </div>
+        <div className="action-meta-right">
+          {cleared} cleared · {queue.length} to go
+        </div>
+      </div>
+      <div key={txn.id} className="action-card slide-in">
+        <div className="ac-top">
+          <div className="ac-top-left">
+            <div className="ac-counterparty">{counterparty}</div>
+            <div className="ac-date">{dateLabel} · {dayLabel} · {txn.source}</div>
+          </div>
+          <div className={`ac-amount ${txn.type}`}>
+            {txn.type === "debit" ? "−" : "+"}{formatINR(txn.amount)}
+          </div>
+        </div>
+
+        <div className="ac-desc">{txn.description}</div>
+
+        <div className="ac-hypothesis">
+          <Sparkles size={12} />
+          <span><strong>AI thinks:</strong> {cat.hypothesis || cat.category}</span>
+          <span className="ac-confidence">{Math.round((cat.confidence || 0) * 100)}% sure</span>
+        </div>
+
+        <div className="ac-chips">
+          {(cat.chips || [cat.category]).slice(0, 4).map((c) => (
+            <button key={c} className="chip" onClick={() => submit(c)}>{c}</button>
+          ))}
+          {CATEGORIES.filter((c) => !(cat.chips || []).includes(c)).slice(0, 2).map((c) => (
+            <button key={c} className="chip ghost" onClick={() => submit(c)}>{c}</button>
           ))}
         </div>
-        <div style={{ height: 80, marginTop: 12 }}>
-          <ResponsiveContainer>
-            <BarChart layout="vertical" data={chartData} stackOffset="expand">
-              <XAxis type="number" hide domain={[0, 1]} />
-              <YAxis type="category" dataKey="name" hide />
-              {breakdown.map((b, i) => (
-                <Bar
-                  key={b.source}
-                  dataKey={b.source}
-                  stackId="a"
-                  fill={colors[i % colors.length]}
-                  radius={i === 0 ? [6, 0, 0, 6] : i === breakdown.length - 1 ? [0, 6, 6, 0] : 0}
-                />
-              ))}
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
-    </div>
-  );
-}
 
-function CashFlowCard({ data }) {
-  const weekly = data?.weeklySpend || [];
-  return (
-    <div className="card">
-      <div className="card-label">Cash Flow — This Month</div>
-      <div className="cashflow-stats">
-        <div>
-          <div className="stat-label">Total In</div>
-          <div className="stat-num credit">{formatINR(data?.totalIn || 0)}</div>
+        <div className="ac-input-row">
+          <input
+            className="ac-input"
+            placeholder="Or type a category or note…"
+            value={customInput}
+            onChange={(e) => setCustomInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && customInput.trim()) submit(customInput.trim());
+            }}
+          />
+          <button
+            className="btn-primary sm"
+            disabled={!customInput.trim()}
+            onClick={() => submit(customInput.trim())}
+          >
+            Save <ArrowRight size={12} />
+          </button>
         </div>
-        <div>
-          <div className="stat-label">Total Out</div>
-          <div className="stat-num debit">{formatINR(data?.totalOut || 0)}</div>
-        </div>
-      </div>
-      <div style={{ height: 120, marginTop: 16 }}>
-        <ResponsiveContainer>
-          <BarChart data={weekly}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#dbeafe" vertical={false} />
-            <XAxis dataKey="week" tick={{ fontSize: 11, fill: "#94a3b8" }} axisLine={false} tickLine={false} />
-            <YAxis hide />
-            <Tooltip
-              cursor={{ fill: "rgba(37,99,235,0.06)" }}
-              contentStyle={{ borderRadius: 8, border: "1px solid #bfdbfe", fontSize: 12 }}
-              formatter={(v) => formatINR(v)}
+
+        <div className="ac-footer">
+          <label className="rule-toggle">
+            <input
+              type="checkbox"
+              checked={showRule}
+              onChange={(e) => setShowRule(e.target.checked)}
             />
-            <Bar dataKey="amount" fill="#2563eb" radius={[6, 6, 0, 0]} />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-      <div className="ai-badge">
-        <span className="badge-tag">Spend Pulse</span>
-        <div className="badge-text">{data?.spendPulse || ""}</div>
-      </div>
-    </div>
-  );
-}
-
-function CategoryCard({ categories, watch }) {
-  const palette = ["#2563eb", "#93c5fd", "#6ee7b7", "#fcd34d", "#fca5a5", "#c4b5fd", "#f9a8d4", "#94a3b8"];
-  return (
-    <div className="card">
-      <div className="card-label">Top Spending Categories</div>
-      <div style={{ height: 180, marginTop: 8 }}>
-        <ResponsiveContainer>
-          <PieChart>
-            <Pie
-              data={categories}
-              dataKey="amount"
-              nameKey="name"
-              innerRadius={45}
-              outerRadius={75}
-              paddingAngle={2}
-            >
-              {categories.map((_, i) => (
-                <Cell key={i} fill={palette[i % palette.length]} />
-              ))}
-            </Pie>
-            <Tooltip
-              contentStyle={{ borderRadius: 8, border: "1px solid #bfdbfe", fontSize: 12 }}
-              formatter={(v) => formatINR(v)}
-            />
-          </PieChart>
-        </ResponsiveContainer>
-      </div>
-      <div className="cat-legend">
-        {categories.slice(0, 6).map((c, i) => (
-          <div key={c.name} className="cat-row">
-            <div className="dot-sm" style={{ background: palette[i % palette.length] }} />
-            <div className="cat-name">{c.name}</div>
-            <div className="cat-amt">{formatINR(c.amount)}</div>
-            <div className="cat-pct">{Math.round(c.percentage)}%</div>
-          </div>
-        ))}
-      </div>
-      <div className="ai-badge">
-        <span className="badge-tag">Category Watch</span>
-        <div className="badge-text">{watch || ""}</div>
-      </div>
-    </div>
-  );
-}
-
-function AccountsRow({ sources, transactions }) {
-  const summaries = useMemo(() => {
-    return sources
-      .filter((s) => s.file)
-      .map((s) => {
-        const txns = transactions.filter((t) => t.source === s.name);
-        const debits = txns.filter((t) => t.type === "debit").reduce((a, b) => a + b.amount, 0);
-        const credits = txns.filter((t) => t.type === "credit").reduce((a, b) => a + b.amount, 0);
-        const lastBalance = [...txns].reverse().find((t) => t.balance != null)?.balance;
-        const total = debits + credits || 1;
-        return {
-          name: s.name,
-          color: s.color,
-          count: txns.length,
-          debits,
-          credits,
-          balance: lastBalance,
-          spendRatio: debits / total,
-        };
-      });
-  }, [sources, transactions]);
-
-  return (
-    <div className="accounts-row">
-      {summaries.map((s) => (
-        <div key={s.name} className="mini-account-card">
-          <div className="mini-header">
-            <div className="dot-sm" style={{ background: s.color }} />
-            <div className="mini-name">{s.name}</div>
-          </div>
-          {s.balance != null && (
-            <div className="mini-balance">{formatINR(s.balance)}</div>
-          )}
-          <div className="mini-count">{s.count} transactions</div>
-          <div className="ratio-bar">
-            <div className="ratio-debit" style={{ width: `${s.spendRatio * 100}%` }} />
-          </div>
-          <div className="ratio-labels">
-            <span>Out {formatINR(s.debits)}</span>
-            <span>In {formatINR(s.credits)}</span>
-          </div>
+            <span>Always categorize "{counterparty}" this way</span>
+          </label>
+          <button className="link-btn" onClick={() => onSkip(txn.id)}>
+            <SkipForward size={12} /> Skip
+          </button>
         </div>
-      ))}
+      </div>
     </div>
   );
 }
 
-function InsightsPanel({ report }) {
+function InsightsBlock({ report, refreshing, onRefresh }) {
+  if (!report) {
+    return (
+      <div className="card insights-empty">
+        <div className="card-label">Intelligence Report</div>
+        <div className="insights-empty-text">
+          Clear a few transactions and I'll generate sharper insights.
+        </div>
+        <button className="btn-ghost sm" onClick={onRefresh}>
+          <Sparkles size={12} /> Generate now
+        </button>
+      </div>
+    );
+  }
   return (
     <div className="insights-panel">
-      <div className="insights-header">Intelligence Report</div>
+      <div className="insights-top">
+        <div className="insights-header">Intelligence Report</div>
+        <button className="btn-ghost sm dark" onClick={onRefresh} disabled={refreshing}>
+          <RefreshCw size={12} className={refreshing ? "spin" : ""} /> Refresh
+        </button>
+      </div>
       <div className="insights-grid">
         <div>
-          <div className="insight-col-head">
-            <ArrowDown size={16} /> Spend Less
-          </div>
+          <div className="insight-col-head"><ArrowDown size={14} /> Spend Less</div>
           {(report.spendLess || []).map((it, i) => (
             <div key={i} className="insight-item">
               <span className="badge-tag dark">{it.category}</span>
@@ -757,9 +636,7 @@ function InsightsPanel({ report }) {
           ))}
         </div>
         <div>
-          <div className="insight-col-head">
-            <ArrowUp size={16} /> Spend More
-          </div>
+          <div className="insight-col-head"><ArrowUp size={14} /> Spend More</div>
           {(report.spendMore || []).map((it, i) => (
             <div key={i} className="insight-item">
               <span className="badge-tag dark">{it.category}</span>
@@ -768,9 +645,7 @@ function InsightsPanel({ report }) {
           ))}
         </div>
         <div>
-          <div className="insight-col-head">
-            <AlertTriangle size={16} /> Watch Out
-          </div>
+          <div className="insight-col-head"><AlertTriangle size={14} /> Watch Out</div>
           {(report.watchOut || []).map((it, i) => (
             <div key={i} className="insight-item">
               <span className="badge-tag dark">{it.flag}</span>
@@ -785,15 +660,18 @@ function InsightsPanel({ report }) {
 
 function ActionSteps({ steps }) {
   const [done, setDone] = useState({});
+  if (!steps || steps.length === 0) return null;
   return (
     <div className="action-section">
-      <div className="action-header">Your Next 5 Moves</div>
+      <div className="action-header-row">
+        <div className="action-header">Your Next 5 Moves</div>
+      </div>
       <div className="action-list">
         {steps.map((s, i) => {
           const priorityClass =
             s.priority === "URGENT" ? "pri-urgent" : s.priority === "THIS WEEK" ? "pri-week" : "pri-month";
           return (
-            <div key={i} className={`action-card ${done[i] ? "done" : ""}`}>
+            <div key={i} className={`action-step-card ${done[i] ? "done" : ""}`}>
               <div className="action-num">{i + 1}</div>
               <div className="action-body">
                 <div className="action-title">{s.title}</div>
@@ -804,7 +682,6 @@ function ActionSteps({ steps }) {
                 <button
                   className={`checkbox ${done[i] ? "checked" : ""}`}
                   onClick={() => setDone((d) => ({ ...d, [i]: !d[i] }))}
-                  aria-label="Mark done"
                 >
                   {done[i] && <Check size={14} strokeWidth={3} />}
                 </button>
@@ -812,6 +689,61 @@ function ActionSteps({ steps }) {
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+function CategoryChart({ stats }) {
+  const palette = ["#2563eb", "#93c5fd", "#6ee7b7", "#fcd34d", "#fca5a5", "#c4b5fd", "#f9a8d4", "#94a3b8"];
+  const data = stats.categoryBreakdown.slice(0, 8);
+  return (
+    <div className="card">
+      <div className="card-label">Spending by Category</div>
+      <div style={{ height: 200 }}>
+        <ResponsiveContainer>
+          <PieChart>
+            <Pie data={data} dataKey="amount" nameKey="name" innerRadius={55} outerRadius={90} paddingAngle={2}>
+              {data.map((_, i) => <Cell key={i} fill={palette[i % palette.length]} />)}
+            </Pie>
+            <Tooltip
+              contentStyle={{ borderRadius: 8, border: "1px solid var(--border)", fontSize: 12 }}
+              formatter={(v) => formatINR(v)}
+            />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+      <div className="cat-legend">
+        {data.map((c, i) => (
+          <div key={c.name} className="cat-row">
+            <div className="dot-sm" style={{ background: palette[i % palette.length] }} />
+            <div className="cat-name">{c.name}</div>
+            <div className="cat-amt">{formatINR(c.amount)}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function WeeklyChart({ stats }) {
+  return (
+    <div className="card">
+      <div className="card-label">Weekly Spend Pattern</div>
+      <div style={{ height: 200 }}>
+        <ResponsiveContainer>
+          <BarChart data={stats.weeklySpend}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#dbeafe" vertical={false} />
+            <XAxis dataKey="week" tick={{ fontSize: 11, fill: "#94a3b8" }} axisLine={false} tickLine={false} />
+            <YAxis hide />
+            <Tooltip
+              cursor={{ fill: "rgba(37,99,235,0.06)" }}
+              contentStyle={{ borderRadius: 8, border: "1px solid var(--border)", fontSize: 12 }}
+              formatter={(v) => formatINR(v)}
+            />
+            <Bar dataKey="amount" fill="#2563eb" radius={[6, 6, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
       </div>
     </div>
   );
@@ -825,287 +757,398 @@ function Toast({ message, onClose }) {
   return <div className="toast">{message}</div>;
 }
 
-function DashboardScreen({ report, sources, transactions, analyzedAt, onReupload }) {
+/* ============================ APP ============================ */
+
+export default function App() {
+  const [transactions, setTransactions] = useLocalStorage(LS_KEYS.txns, []);
+  const [categorizations, setCategorizations] = useLocalStorage(LS_KEYS.cats, {}); // {txnId: {category, confidence, hypothesis, chips, userOverride}}
+  const [rules, setRules] = useLocalStorage(LS_KEYS.rules, []); // [{pattern, category}]
+  const [cleared, setCleared] = useLocalStorage(LS_KEYS.cleared, {}); // {txnId: true}
+  const [report, setReport] = useLocalStorage(LS_KEYS.report, null);
+  const [sources] = useState(DEFAULT_SOURCES);
+
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [procMsg, setProcMsg] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
   const [toast, setToast] = useState(null);
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const [error, setError] = useState(null);
+  const clearedSinceReportRef = useRef(0);
+
+  /* --- Derived: Action Center queue --- */
+  const queue = useMemo(() => {
+    const items = transactions
+      .filter((t) => !cleared[t.id])
+      .map((txn) => {
+        const cat = categorizations[txn.id] || { category: "Other", confidence: 0, hypothesis: "Unknown", chips: [] };
+        const priority = (1 - (cat.confidence || 0)) * Math.log(1 + txn.amount);
+        return { txn, cat, priority };
+      })
+      .sort((a, b) => b.priority - a.priority);
+    return items;
+  }, [transactions, categorizations, cleared]);
+
+  useEffect(() => {
+    if (currentIdx >= queue.length) setCurrentIdx(0);
+  }, [queue.length, currentIdx]);
+
+  /* --- Derived: stats --- */
+  const stats = useMemo(() => {
+    const debits = transactions.filter((t) => t.type === "debit");
+    const credits = transactions.filter((t) => t.type === "credit");
+    const totalOut = debits.reduce((a, b) => a + b.amount, 0);
+    const totalIn = credits.reduce((a, b) => a + b.amount, 0);
+
+    // Net worth: latest balance per source + all investment values
+    const bySource = {};
+    transactions.forEach((t) => {
+      if (!bySource[t.source]) bySource[t.source] = [];
+      bySource[t.source].push(t);
+    });
+    let netWorth = 0;
+    Object.entries(bySource).forEach(([src, txns]) => {
+      const sorted = [...txns].sort((a, b) => a.date.localeCompare(b.date));
+      const lastWithBalance = [...sorted].reverse().find((t) => t.balance != null);
+      if (lastWithBalance) netWorth += lastWithBalance.balance;
+      else {
+        // fallback: credits - debits for that source
+        const cr = txns.filter((t) => t.type === "credit").reduce((a, b) => a + b.amount, 0);
+        const dr = txns.filter((t) => t.type === "debit").reduce((a, b) => a + b.amount, 0);
+        netWorth += cr - dr;
+      }
+    });
+
+    // Category breakdown (debits only, excluding transfers)
+    const catTotals = {};
+    debits.forEach((t) => {
+      const cat = categorizations[t.id]?.category || "Other";
+      if (cat === "Transfer to Self") return;
+      catTotals[cat] = (catTotals[cat] || 0) + t.amount;
+    });
+    const categoryBreakdown = Object.entries(catTotals)
+      .map(([name, amount]) => ({ name, amount }))
+      .sort((a, b) => b.amount - a.amount);
+    const topCategory = categoryBreakdown[0]?.name || null;
+    const topCategoryAmount = categoryBreakdown[0]?.amount || 0;
+
+    // Weekly spend
+    const weekMap = {};
+    debits.forEach((t) => {
+      const d = new Date(t.date);
+      const day = d.getDay();
+      const monday = new Date(d);
+      monday.setDate(d.getDate() - ((day + 6) % 7));
+      const key = monday.toISOString().slice(5, 10);
+      weekMap[key] = (weekMap[key] || 0) + t.amount;
+    });
+    const weeklySpend = Object.entries(weekMap)
+      .map(([week, amount]) => ({ week, amount }))
+      .sort((a, b) => a.week.localeCompare(b.week))
+      .slice(-8);
+
+    // Confidence: % of debit volume that has high confidence OR is cleared
+    let confidentVolume = 0;
+    let totalVolume = 0;
+    debits.forEach((t) => {
+      totalVolume += t.amount;
+      const cat = categorizations[t.id];
+      if (cleared[t.id] || (cat && cat.confidence >= 0.8) || cat?.userOverride) {
+        confidentVolume += t.amount;
+      }
+    });
+    const confidence = totalVolume > 0 ? confidentVolume / totalVolume : 0;
+
+    return {
+      netWorth,
+      totalIn,
+      totalOut,
+      categoryBreakdown,
+      topCategory,
+      topCategoryAmount,
+      weeklySpend,
+      confidence,
+    };
+  }, [transactions, categorizations, cleared]);
+
+  /* --- Apply existing rules to new transactions --- */
+  const applyRules = useCallback((txns, existingCats) => {
+    const newCats = { ...existingCats };
+    txns.forEach((t) => {
+      const desc = (t.description || "").toUpperCase();
+      const matched = rules.find((r) => desc.includes(r.pattern.toUpperCase()));
+      if (matched) {
+        newCats[t.id] = {
+          category: matched.category,
+          confidence: 1,
+          hypothesis: `Rule match: "${matched.pattern}"`,
+          chips: [matched.category],
+          userOverride: true,
+        };
+      }
+    });
+    return newCats;
+  }, [rules]);
+
+  /* --- Upload flow --- */
+  const handleParse = async (stagedFiles) => {
+    setError(null);
+    setProcessing(true);
+    setProgress(5);
+    setProcMsg("Reading your statements...");
+    try {
+      const newTxns = [];
+      const entries = Object.entries(stagedFiles).filter(([, f]) => f);
+      const slice = 50 / Math.max(entries.length, 1);
+      for (let i = 0; i < entries.length; i++) {
+        const [sourceId, file] = entries[i];
+        const source = sources.find((s) => s.id === sourceId);
+        const ext = file.name.split(".").pop().toLowerCase();
+        try {
+          if (ext === "csv") {
+            const t = await parseCSV(file, source.name);
+            newTxns.push(...t);
+          } else if (ext === "pdf") {
+            setProcMsg(`Reading ${source.name}...`);
+            const text = await extractPDFText(file);
+            if (text.length < 50) throw new Error(`Could not read ${file.name}`);
+            const res = await callClaude(PARSE_PDF_SYSTEM, text.slice(0, 60000), 4000);
+            const parsed = safeParseJSON(res) || [];
+            parsed.forEach((p, idx) => {
+              if (p.date && p.amount > 0) {
+                newTxns.push({
+                  id: `${source.name}-${p.date}-${idx}-${Math.random().toString(36).slice(2, 7)}`,
+                  ...p,
+                  source: source.name,
+                });
+              }
+            });
+          }
+        } catch (err) {
+          console.error("Source error", source?.name, err);
+        }
+        setProgress(5 + slice * (i + 1));
+      }
+
+      if (newTxns.length === 0) throw new Error("No transactions found.");
+
+      // Merge with existing
+      const allTxns = [...transactions, ...newTxns];
+
+      // Apply rules first
+      let nextCats = applyRules(newTxns, categorizations);
+      setProgress(60);
+      setProcMsg("Categorizing transactions...");
+
+      // Bulk categorize via AI (only those without rule match)
+      const toCategorize = newTxns.filter((t) => !nextCats[t.id]);
+      if (toCategorize.length > 0) {
+        // Batch in chunks of 80 to keep tokens manageable
+        const chunkSize = 80;
+        for (let i = 0; i < toCategorize.length; i += chunkSize) {
+          const chunk = toCategorize.slice(i, i + chunkSize);
+          const payload = chunk.map((t) => ({
+            date: t.date,
+            description: t.description,
+            amount: t.amount,
+            type: t.type,
+          }));
+          try {
+            const res = await callClaude(BULK_CAT_SYSTEM, JSON.stringify(payload), 4000);
+            const arr = safeParseJSON(res) || [];
+            chunk.forEach((t, idx) => {
+              const c = arr[idx] || {};
+              nextCats[t.id] = {
+                category: c.category || "Other",
+                confidence: typeof c.confidence === "number" ? c.confidence : 0.3,
+                hypothesis: c.hypothesis || "",
+                chips: Array.isArray(c.chips) && c.chips.length ? c.chips : [c.category || "Other"],
+              };
+            });
+          } catch (err) {
+            chunk.forEach((t) => {
+              nextCats[t.id] = { category: "Other", confidence: 0.2, hypothesis: "Could not categorize", chips: ["Other"] };
+            });
+          }
+          setProgress(60 + ((i + chunkSize) / toCategorize.length) * 35);
+        }
+      }
+
+      setProgress(100);
+      setTransactions(allTxns);
+      setCategorizations(nextCats);
+      clearedSinceReportRef.current = 0;
+      setTimeout(() => {
+        setProcessing(false);
+        setUploadOpen(false);
+        setToast(`Added ${newTxns.length} transactions`);
+        // Auto-generate first report
+        regenerateReport(allTxns, nextCats, cleared);
+      }, 400);
+    } catch (err) {
+      setError(err.message || "Something went wrong.");
+      setProcessing(false);
+    }
+  };
+
+  /* --- Clear a transaction --- */
+  const handleClear = (txnId, category, makeRule) => {
+    setCategorizations((prev) => ({
+      ...prev,
+      [txnId]: {
+        ...(prev[txnId] || {}),
+        category,
+        confidence: 1,
+        userOverride: true,
+      },
+    }));
+    setCleared((prev) => ({ ...prev, [txnId]: true }));
+
+    if (makeRule) {
+      const txn = transactions.find((t) => t.id === txnId);
+      if (txn) {
+        const pattern = extractCounterparty(txn.description).toUpperCase();
+        if (pattern && pattern !== "UNKNOWN") {
+          setRules((prev) => [...prev.filter((r) => r.pattern !== pattern), { pattern, category }]);
+          // Apply to all matching past txns
+          setCategorizations((prev) => {
+            const next = { ...prev };
+            transactions.forEach((t) => {
+              if ((t.description || "").toUpperCase().includes(pattern)) {
+                next[t.id] = { ...next[t.id], category, confidence: 1, userOverride: true };
+              }
+            });
+            return next;
+          });
+          setToast(`Rule saved: "${pattern}" → ${category}`);
+        }
+      }
+    }
+
+    clearedSinceReportRef.current += 1;
+    if (clearedSinceReportRef.current >= 10) {
+      clearedSinceReportRef.current = 0;
+      regenerateReport(transactions, { ...categorizations, [txnId]: { category, confidence: 1, userOverride: true } }, { ...cleared, [txnId]: true });
+    }
+  };
+
+  const handleSkip = (txnId) => {
+    setCleared((prev) => ({ ...prev, [txnId]: "skipped" }));
+  };
+
+  /* --- Insights generation --- */
+  const regenerateReport = async (txns, cats, cle) => {
+    if (!txns || txns.length === 0) return;
+    setRefreshing(true);
+    try {
+      const payload = txns.slice(0, 300).map((t) => ({
+        date: t.date,
+        amount: t.amount,
+        type: t.type,
+        source: t.source,
+        category: cats[t.id]?.category || "Other",
+      }));
+      const res = await callClaude(
+        REPORT_SYSTEM,
+        `TRANSACTIONS: ${JSON.stringify(payload)}\nNET_WORTH_ESTIMATE: ${stats.netWorth}`,
+        3000
+      );
+      const parsed = safeParseJSON(res);
+      if (parsed) setReport(parsed);
+    } catch (err) {
+      console.error("Report failed", err);
+    }
+    setRefreshing(false);
+  };
+
+  const handleManualRefresh = () => regenerateReport(transactions, categorizations, cleared);
+
+  const handleReset = () => {
+    if (!confirm("Clear all data and start over?")) return;
+    setTransactions([]);
+    setCategorizations({});
+    setCleared({});
+    setReport(null);
+    setRules([]);
+    setToast("Everything cleared");
+  };
+
+  const hasData = transactions.length > 0;
+
   return (
-    <div className="dashboard-screen">
+    <div className="app-root">
+      <style>{styleCSS}</style>
+
       <div className="top-bar">
         <div className="top-left">
-          <span className="brand-name" style={{ fontSize: 18 }}>Clearwater</span>
-          <span className="top-meta">Last analyzed: {analyzedAt}</span>
+          <span className="brand-name top-brand">Clearwater</span>
+          {hasData && <span className="top-meta">{transactions.length} transactions · {rules.length} rules</span>}
         </div>
         <div className="top-right">
-          <button className="btn-ghost" onClick={onReupload}>
-            <RefreshCw size={14} /> Re-upload
-          </button>
-          <button className="btn-ghost" onClick={() => setToast("Coming soon")}>
-            <Download size={14} /> Export PDF
+          {hasData && (
+            <button className="btn-ghost sm" onClick={handleReset}>Reset</button>
+          )}
+          <button className="btn-primary sm" onClick={() => setUploadOpen(true)}>
+            <Upload size={14} /> Upload
           </button>
         </div>
       </div>
 
-      <div className="dash-section" style={{ animationDelay: "0ms" }}>
-        <NetWorthCard data={report.netWorth} />
+      <div className="app-body">
+        {!hasData ? (
+          <EmptyState onUpload={() => setUploadOpen(true)} />
+        ) : (
+          <>
+            <div className="section fade-up">
+              <StatsStrip stats={stats} />
+            </div>
+
+            <div className="section fade-up" style={{ animationDelay: "80ms" }}>
+              <ActionCenter
+                queue={queue}
+                total={transactions.length}
+                current={currentIdx}
+                onClear={handleClear}
+                onSkip={handleSkip}
+              />
+            </div>
+
+            <div className="dash-grid fade-up" style={{ animationDelay: "160ms" }}>
+              <CategoryChart stats={stats} />
+              <WeeklyChart stats={stats} />
+            </div>
+
+            <div className="section fade-up" style={{ animationDelay: "240ms" }}>
+              <InsightsBlock report={report} refreshing={refreshing} onRefresh={handleManualRefresh} />
+            </div>
+
+            {report?.actionSteps && (
+              <div className="section fade-up" style={{ animationDelay: "320ms" }}>
+                <ActionSteps steps={report.actionSteps} />
+              </div>
+            )}
+          </>
+        )}
       </div>
 
-      <div className="dash-grid" style={{ animationDelay: "80ms" }}>
-        <CashFlowCard data={report.cashFlow} />
-        <CategoryCard categories={report.categories || []} watch={report.categoryWatch} />
-      </div>
+      <UploadModal
+        open={uploadOpen}
+        onClose={() => !processing && setUploadOpen(false)}
+        sources={sources}
+        onParse={handleParse}
+        processing={processing}
+        progress={progress}
+        message={procMsg}
+      />
 
-      <div className="dash-section" style={{ animationDelay: "160ms" }}>
-        <div className="section-title">Accounts</div>
-        <AccountsRow sources={sources} transactions={transactions} />
-      </div>
-
-      <div className="dash-section" style={{ animationDelay: "240ms" }}>
-        <InsightsPanel report={report} />
-      </div>
-
-      <div className="dash-section" style={{ animationDelay: "320ms" }}>
-        <ActionSteps steps={report.actionSteps || []} />
-      </div>
-
+      {error && <Toast message={error} onClose={() => setError(null)} />}
       {toast && <Toast message={toast} onClose={() => setToast(null)} />}
     </div>
   );
 }
 
-/* ------------------------------------------------------------------ */
-/*  Root App                                                           */
-/* ------------------------------------------------------------------ */
-
-export default function App() {
-  const [appState, setAppState] = useState("UPLOAD");
-  const [sources, setSources] = useState(DEFAULT_SOURCES);
-  const [allTransactions, setAllTransactions] = useState([]);
-  const [clarifyQuestions, setClarifyQuestions] = useState([]);
-  const [clarifyAnswers, setClarifyAnswers] = useState([]);
-  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
-  const [report, setReport] = useState(null);
-  const [processingProgress, setProcessingProgress] = useState(0);
-  const [processingMessage, setProcessingMessage] = useState(PROCESSING_MESSAGES[0]);
-  const [error, setError] = useState(null);
-  const [analyzedAt, setAnalyzedAt] = useState("");
-
-  // Rotate processing messages
-  useEffect(() => {
-    if (appState !== "PROCESSING") return;
-    let i = 0;
-    const id = setInterval(() => {
-      i = (i + 1) % PROCESSING_MESSAGES.length;
-      setProcessingMessage(PROCESSING_MESSAGES[i]);
-    }, 2500);
-    return () => clearInterval(id);
-  }, [appState]);
-
-  const updateSource = (id, patch) => {
-    setSources((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
-  };
-
-  const handleFileSelect = (id, file) => {
-    if (!file) return;
-    const ext = file.name.split(".").pop().toLowerCase();
-    if (ext !== "csv" && ext !== "pdf") {
-      setError("Only CSV and PDF files are supported.");
-      return;
-    }
-    setError(null);
-    updateSource(id, { file, status: "loaded" });
-  };
-
-  const handleRename = (id, name) => updateSource(id, { name });
-
-  const runAnalysis = async () => {
-    setError(null);
-    setAppState("PROCESSING");
-    setProcessingProgress(5);
-    setProcessingMessage(PROCESSING_MESSAGES[0]);
-    try {
-      const filled = sources.filter((s) => s.file);
-      const txns = [];
-      const slice = 70 / filled.length;
-      for (let i = 0; i < filled.length; i++) {
-        const s = filled[i];
-        const ext = s.file.name.split(".").pop().toLowerCase();
-        try {
-          if (ext === "csv") {
-            const t = await parseCSV(s.file, s.name);
-            txns.push(...t);
-          } else if (ext === "pdf") {
-            const text = await extractPDFText(s.file);
-            if (text.length < 50) {
-              throw new Error(`Could not read PDF: ${s.file.name}`);
-            }
-            const result = await callClaude(PARSE_PDF_SYSTEM, text.slice(0, 60000), 4000);
-            const parsed = safeParseJSON(result) || [];
-            for (const t of parsed) {
-              if (t.date && t.amount > 0) {
-                txns.push({ ...t, source: s.name });
-              }
-            }
-          }
-          updateSource(s.id, { status: "parsed" });
-        } catch (err) {
-          console.error("Source error", s.name, err);
-          updateSource(s.id, { status: "error" });
-        }
-        setProcessingProgress(5 + slice * (i + 1));
-      }
-
-      if (txns.length === 0) {
-        throw new Error("No transactions found in your files.");
-      }
-
-      setAllTransactions(txns);
-      setProcessingProgress(80);
-
-      // AI Call 2 — clarification questions
-      const trimmed = txns.slice(0, 200);
-      let questions = [];
-      try {
-        const res = await callClaude(CLARIFY_SYSTEM, JSON.stringify(trimmed), 2000);
-        questions = safeParseJSON(res) || [];
-      } catch (err) {
-        console.error("Clarify call failed", err);
-        questions = [];
-      }
-      setClarifyQuestions(questions);
-      setClarifyAnswers(new Array(questions.length).fill(null));
-      setCurrentQuestionIndex(0);
-      setProcessingProgress(100);
-
-      if (questions.length > 0) {
-        setTimeout(() => setAppState("CLARIFY"), 400);
-      } else {
-        await generateReport(txns, []);
-      }
-    } catch (err) {
-      setError(err.message || "Something went wrong.");
-      setAppState("UPLOAD");
-    }
-  };
-
-  const generateReport = async (txns, answers) => {
-    setAppState("PROCESSING");
-    setProcessingProgress(60);
-    setProcessingMessage("Preparing your insights...");
-    try {
-      const sourceNames = sources.filter((s) => s.file).map((s) => s.name);
-      const clarifications = clarifyQuestions
-        .map((q, i) => ({
-          transactionIndex: q.transactionIndex,
-          question: q.question,
-          selectedAnswer: answers[i],
-        }))
-        .filter((c) => c.selectedAnswer !== null);
-      const userMsg = `Here is the financial data:
-TRANSACTIONS: ${JSON.stringify(txns.slice(0, 300))}
-CLARIFICATIONS: ${JSON.stringify(clarifications)}
-ACCOUNT SOURCES: ${JSON.stringify(sourceNames)}`;
-      let res;
-      try {
-        res = await callClaude(REPORT_SYSTEM, userMsg, 3000);
-      } catch (err) {
-        // retry once
-        res = await callClaude(REPORT_SYSTEM, userMsg, 3000);
-      }
-      const parsed = safeParseJSON(res);
-      if (!parsed) throw new Error("Could not parse AI response.");
-      setReport(parsed);
-      setProcessingProgress(100);
-      setAnalyzedAt(new Date().toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }));
-      setTimeout(() => setAppState("DASHBOARD"), 400);
-    } catch (err) {
-      setError(err.message || "Report generation failed.");
-      setAppState(clarifyQuestions.length > 0 ? "CLARIFY" : "UPLOAD");
-    }
-  };
-
-  const handleAnswer = (answer) => {
-    setClarifyAnswers((prev) => {
-      const next = [...prev];
-      next[currentQuestionIndex] = answer;
-      return next;
-    });
-    setTimeout(() => {
-      if (currentQuestionIndex < clarifyQuestions.length - 1) {
-        setCurrentQuestionIndex((i) => i + 1);
-      }
-    }, 300);
-  };
-
-  const handleSkip = () => {
-    setClarifyAnswers((prev) => {
-      const next = [...prev];
-      if (next[currentQuestionIndex] == null) next[currentQuestionIndex] = "Skipped";
-      return next;
-    });
-    if (currentQuestionIndex < clarifyQuestions.length - 1) {
-      setCurrentQuestionIndex((i) => i + 1);
-    }
-  };
-
-  const handlePrev = () => {
-    if (currentQuestionIndex > 0) setCurrentQuestionIndex((i) => i - 1);
-  };
-
-  const handleGenerate = () => {
-    generateReport(allTransactions, clarifyAnswers);
-  };
-
-  const handleReupload = () => {
-    setAppState("UPLOAD");
-    setReport(null);
-    setAllTransactions([]);
-    setClarifyQuestions([]);
-    setClarifyAnswers([]);
-    setSources(DEFAULT_SOURCES);
-  };
-
-  return (
-    <div className="app-root">
-      <style>{styleCSS}</style>
-      {appState === "UPLOAD" && (
-        <UploadScreen
-          sources={sources}
-          onFileSelect={handleFileSelect}
-          onRename={handleRename}
-          onAnalyze={runAnalysis}
-          error={error}
-        />
-      )}
-      {appState === "PROCESSING" && (
-        <ProcessingScreen progress={processingProgress} message={processingMessage} />
-      )}
-      {appState === "CLARIFY" && (
-        <ClarifyScreen
-          questions={clarifyQuestions}
-          transactions={allTransactions}
-          answers={clarifyAnswers}
-          current={currentQuestionIndex}
-          onAnswer={handleAnswer}
-          onSkip={handleSkip}
-          onPrev={handlePrev}
-          onGenerate={handleGenerate}
-        />
-      )}
-      {appState === "DASHBOARD" && report && (
-        <DashboardScreen
-          report={report}
-          sources={sources}
-          transactions={allTransactions}
-          analyzedAt={analyzedAt}
-          onReupload={handleReupload}
-        />
-      )}
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/*  Inline CSS                                                         */
-/* ------------------------------------------------------------------ */
+/* ============================ STYLES ============================ */
 
 const styleCSS = `
 @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -1146,25 +1189,35 @@ body { margin: 0; }
   -webkit-font-smoothing: antialiased;
 }
 
-/* Animations */
 @keyframes fadeUp {
-  from { opacity: 0; transform: translateY(16px); }
+  from { opacity: 0; transform: translateY(12px); }
   to { opacity: 1; transform: translateY(0); }
 }
 @keyframes slideIn {
-  from { opacity: 0; transform: translateX(24px); }
+  from { opacity: 0; transform: translateX(20px); }
   to { opacity: 1; transform: translateX(0); }
 }
+@keyframes spin { to { transform: rotate(360deg); } }
 .fade-up { animation: fadeUp 500ms ease both; }
 .slide-in { animation: slideIn 320ms ease both; }
-.dash-section, .dash-grid { animation: fadeUp 600ms ease both; }
+.spin { animation: spin 800ms linear infinite; }
+
+.brand-name {
+  font-family: 'DM Serif Display', serif;
+  color: var(--text-primary);
+}
+.brand-tagline {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
 
 /* Buttons */
 .btn-primary {
   background: var(--accent-primary);
   color: white;
   border: none;
-  padding: 14px 20px;
+  padding: 12px 18px;
   border-radius: var(--radius-md);
   font-family: inherit;
   font-size: 14px;
@@ -1173,12 +1226,13 @@ body { margin: 0; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 6px;
   transition: transform 120ms ease, box-shadow 200ms ease, opacity 200ms;
 }
 .btn-primary:hover:not(:disabled) { box-shadow: var(--shadow-elevated); transform: translateY(-1px); }
 .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
-.btn-block { width: 100%; }
+.btn-primary.sm { padding: 8px 14px; font-size: 13px; }
+.btn-block { width: 100%; margin-top: 16px; }
 
 .btn-ghost {
   background: transparent;
@@ -1197,6 +1251,25 @@ body { margin: 0; }
 }
 .btn-ghost:hover:not(:disabled) { background: var(--accent-muted); }
 .btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-ghost.sm { padding: 6px 12px; font-size: 12px; }
+.btn-ghost.dark {
+  color: var(--accent-soft);
+  border-color: rgba(147,197,253,0.3);
+}
+.btn-ghost.dark:hover:not(:disabled) { background: rgba(147,197,253,0.1); }
+
+.icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.icon-btn:hover { background: var(--bg-elevated); color: var(--text-primary); }
 
 .link-btn {
   background: transparent;
@@ -1204,207 +1277,292 @@ body { margin: 0; }
   color: var(--text-tertiary);
   cursor: pointer;
   font-family: inherit;
-  font-size: 13px;
-}
-.link-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-
-/* UPLOAD SCREEN */
-.upload-screen {
-  max-width: 560px;
-  margin: 0 auto;
-  padding: 80px 24px 64px;
-}
-.brand { margin-bottom: 32px; }
-.brand-name {
-  font-family: 'DM Serif Display', serif;
-  font-size: 28px;
-  color: var(--text-primary);
-  margin-bottom: 4px;
-}
-.brand-tagline {
-  font-size: 14px;
-  color: var(--text-secondary);
-}
-.brand-rule {
-  height: 1px;
-  background: var(--border);
-  margin-top: 20px;
-}
-
-.source-list { display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px; }
-.source-slot {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  padding: 16px 18px;
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-card);
-  transition: border-color 200ms, background 200ms;
-}
-.source-slot.drag-over {
-  border-color: var(--accent-primary);
-  background: var(--accent-muted);
-}
-.dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-.slot-center { flex: 1; min-width: 0; }
-.slot-name { font-size: 14px; font-weight: 500; cursor: pointer; }
-.slot-hint { font-size: 12px; color: var(--text-tertiary); margin-top: 2px; }
-.rename-input {
-  font-family: inherit;
-  font-size: 14px;
-  font-weight: 500;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 4px 8px;
-  background: var(--bg-elevated);
-  outline: none;
-}
-.slot-right { display: flex; align-items: center; gap: 8px; }
-.check-icon {
-  width: 28px; height: 28px; border-radius: 50%;
-  background: var(--success); color: white;
-  display: flex; align-items: center; justify-content: center;
-}
-
-.upload-foot {
-  text-align: center;
   font-size: 12px;
-  color: var(--text-tertiary);
-  margin-top: 12px;
-}
-.error-card {
-  background: #fef2f2;
-  border: 1px solid #fecaca;
-  color: #991b1b;
-  padding: 12px 16px;
-  border-radius: var(--radius-md);
-  font-size: 13px;
-  margin-bottom: 16px;
-}
-
-/* PROCESSING */
-.processing-screen {
-  min-height: 100vh;
-  background: var(--bg-deep);
-  display: flex;
-  flex-direction: column;
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
-  color: var(--text-inverse);
-  gap: 32px;
+  gap: 4px;
 }
-.ring-wrap { position: relative; width: 180px; height: 180px; }
-.ring-pct {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: 'DM Serif Display', serif;
-  font-size: 48px;
-}
-.proc-message {
-  font-size: 14px;
-  font-weight: 300;
-  color: var(--text-tertiary);
-  animation: fadeUp 500ms ease;
-}
+.link-btn:hover { color: var(--accent-primary); }
 
-/* CLARIFY */
-.clarify-screen {
-  max-width: 520px;
-  margin: 0 auto;
-  padding: 60px 24px;
-}
-.clarify-progress {
-  height: 3px;
-  background: var(--border);
-  border-radius: 2px;
-  overflow: hidden;
-  margin-bottom: 32px;
-}
-.clarify-progress-fill {
-  height: 100%;
-  background: var(--accent-primary);
-  transition: width 300ms ease;
-}
-.question-card {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 24px;
-  box-shadow: var(--shadow-card);
-  margin-top: 24px;
-}
-.txn-strip {
+/* TOP BAR */
+.top-bar {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding-bottom: 12px;
+  padding: 20px 32px;
   border-bottom: 1px solid var(--border);
-  margin-bottom: 12px;
+  background: rgba(255,255,255,0.6);
+  backdrop-filter: blur(8px);
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
-.txn-date { font-size: 12px; color: var(--text-tertiary); }
-.txn-source { font-size: 13px; color: var(--text-secondary); margin-top: 2px; }
-.txn-amount { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 500; }
-.txn-amount.debit { color: var(--danger); }
-.txn-amount.credit { color: var(--success); }
-.txn-desc { font-size: 13px; color: var(--text-secondary); margin-bottom: 16px; word-break: break-word; }
-.question-text { font-size: 16px; color: var(--text-primary); margin-bottom: 16px; font-weight: 500; }
-.chip-wrap { display: flex; flex-wrap: wrap; gap: 8px; }
-.chip {
-  background: transparent;
-  border: 1px solid var(--border-strong);
+.top-left { display: flex; align-items: baseline; gap: 16px; }
+.top-brand { font-size: 22px; }
+.top-meta { font-size: 12px; color: var(--text-tertiary); }
+.top-right { display: flex; gap: 8px; }
+
+.app-body {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 32px 32px 80px;
+}
+.section { margin-bottom: 32px; }
+
+/* EMPTY STATE */
+.empty-state {
+  max-width: 480px;
+  margin: 80px auto;
+  text-align: center;
+  padding: 48px 32px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-card);
+}
+.empty-icon {
+  width: 64px; height: 64px;
+  background: var(--accent-muted);
+  border-radius: 50%;
   color: var(--accent-primary);
+  margin: 0 auto 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.empty-title {
+  font-family: 'DM Serif Display', serif;
+  font-size: 28px;
+  margin-bottom: 8px;
+}
+.empty-sub {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin-bottom: 24px;
+  line-height: 1.5;
+}
+.empty-foot {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-top: 16px;
+}
+
+/* STATS STRIP */
+.stats-strip {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 0;
+  align-items: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px 24px;
+  box-shadow: var(--shadow-card);
+}
+.stat-divider {
+  width: 1px;
+  height: 40px;
+  background: var(--border);
+  justify-self: center;
+}
+.stat-block { padding: 0 8px; }
+.stat-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-tertiary);
+  margin-bottom: 6px;
+}
+.stat-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 20px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+.stat-value.display {
+  font-family: 'DM Serif Display', serif;
+  font-size: 28px;
+  font-weight: 400;
+}
+.stat-value.sm { font-family: 'DM Sans', sans-serif; font-size: 15px; font-weight: 500; }
+.stat-sub { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
+.confidence-bar {
+  width: 100%;
+  height: 4px;
+  background: var(--bg-elevated);
+  border-radius: 2px;
+  margin-top: 6px;
+  overflow: hidden;
+}
+.confidence-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-primary), var(--accent-soft));
+  transition: width 500ms ease;
+}
+
+/* ACTION CENTER */
+.action-card-wrap { }
+.action-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  padding: 0 4px;
+}
+.action-meta-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent-primary);
+  font-weight: 600;
+}
+.action-meta-right { font-size: 12px; color: var(--text-tertiary); }
+
+.action-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  padding: 28px;
+  box-shadow: var(--shadow-elevated);
+}
+.ac-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 4px;
+}
+.ac-counterparty {
+  font-family: 'DM Serif Display', serif;
+  font-size: 24px;
+  line-height: 1.2;
+}
+.ac-date { font-size: 12px; color: var(--text-tertiary); margin-top: 4px; }
+.ac-amount {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 26px;
+  font-weight: 500;
+}
+.ac-amount.debit { color: var(--text-primary); }
+.ac-amount.credit { color: var(--success); }
+
+.ac-desc {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin: 16px 0;
+  padding: 10px 12px;
+  background: var(--bg-elevated);
+  border-radius: var(--radius-sm);
+  font-family: 'JetBrains Mono', monospace;
+  word-break: break-all;
+  line-height: 1.4;
+}
+
+.ac-hypothesis {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+  padding: 10px 14px;
+  background: linear-gradient(90deg, rgba(37,99,235,0.06), transparent);
+  border-left: 2px solid var(--accent-primary);
+  border-radius: var(--radius-sm);
+}
+.ac-hypothesis strong { color: var(--text-primary); font-weight: 500; }
+.ac-confidence {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--accent-primary);
+  background: var(--accent-muted);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 500;
+}
+
+.ac-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+.chip {
+  background: var(--accent-primary);
+  color: white;
+  border: none;
   padding: 8px 14px;
   border-radius: 999px;
   font-family: inherit;
   font-size: 13px;
   cursor: pointer;
-  transition: all 150ms;
+  transition: transform 120ms, opacity 200ms;
 }
-.chip:hover { background: var(--accent-muted); transform: scale(1.02); }
-.other-input-wrap {
-  display: flex;
-  gap: 8px;
-  margin-top: 12px;
+.chip:hover { transform: scale(1.03); }
+.chip.ghost {
+  background: transparent;
+  color: var(--accent-primary);
+  border: 1px solid var(--border-strong);
 }
-.other-input {
+.chip.ghost:hover { background: var(--accent-muted); }
+
+.ac-input-row { display: flex; gap: 8px; margin-bottom: 16px; }
+.ac-input {
   flex: 1;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
   font-family: inherit;
   font-size: 14px;
   outline: none;
+  transition: border-color 150ms;
 }
-.other-input:focus { border-color: var(--accent-soft); }
-.clarify-nav { display: flex; justify-content: space-between; margin-top: 20px; }
+.ac-input:focus { border-color: var(--accent-soft); background: white; }
 
-/* DASHBOARD */
-.dashboard-screen {
-  max-width: 1100px;
-  margin: 0 auto;
-  padding: 32px 24px 80px;
-}
-.top-bar {
+.ac-footer {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 32px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
 }
-.top-left { display: flex; align-items: baseline; gap: 16px; }
-.top-meta { font-size: 12px; color: var(--text-tertiary); }
-.top-right { display: flex; gap: 8px; }
+.rule-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.rule-toggle input { cursor: pointer; }
 
-.dash-section { margin-bottom: 32px; }
-.section-title {
+.action-empty {
+  text-align: center;
+  padding: 48px 32px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+}
+.action-empty-icon {
+  width: 56px; height: 56px;
+  background: var(--accent-muted);
+  border-radius: 50%;
+  color: var(--accent-primary);
+  margin: 0 auto 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.action-empty-title {
   font-family: 'DM Serif Display', serif;
-  font-size: 20px;
-  margin-bottom: 16px;
+  font-size: 22px;
+  margin-bottom: 6px;
+}
+.action-empty-sub { font-size: 13px; color: var(--text-secondary); }
+
+/* DASH GRID */
+.dash-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
 }
 
 .card {
@@ -1413,33 +1571,17 @@ body { margin: 0; }
   border-radius: var(--radius-lg);
   padding: 24px;
   box-shadow: var(--shadow-card);
-  transition: box-shadow 200ms;
 }
-.card:hover { box-shadow: var(--shadow-elevated); }
 .card-label {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--text-tertiary);
-  margin-bottom: 12px;
+  margin-bottom: 16px;
 }
 
-.networth-card {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 32px;
-  align-items: center;
-}
-.big-number {
-  font-family: 'DM Serif Display', serif;
-  font-size: 52px;
-  line-height: 1;
-  color: var(--text-primary);
-  margin-bottom: 8px;
-}
-.sub-text { font-size: 13px; color: var(--text-secondary); }
-.legend-grid { display: flex; flex-direction: column; gap: 8px; }
-.legend-row {
+.cat-legend { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.cat-row {
   display: grid;
   grid-template-columns: 12px 1fr auto;
   gap: 10px;
@@ -1447,114 +1589,25 @@ body { margin: 0; }
   font-size: 13px;
 }
 .dot-sm { width: 10px; height: 10px; border-radius: 50%; }
-.legend-name { color: var(--text-secondary); }
-.legend-val { font-family: 'JetBrains Mono', monospace; font-weight: 500; }
-
-.dash-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 24px;
-  margin-bottom: 32px;
-}
-
-.cashflow-stats {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  margin-top: 8px;
-}
-.stat-label { font-size: 12px; color: var(--text-tertiary); margin-bottom: 4px; }
-.stat-num {
-  font-family: 'DM Serif Display', serif;
-  font-size: 28px;
-}
-.stat-num.debit { color: var(--text-primary); }
-.stat-num.credit { color: var(--text-primary); }
-
-.ai-badge {
-  margin-top: 16px;
-  padding: 12px 14px;
-  background: var(--bg-elevated);
-  border-radius: var(--radius-md);
-}
-.badge-tag {
-  display: inline-block;
-  background: var(--accent-muted);
-  color: var(--accent-primary);
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  padding: 3px 8px;
-  border-radius: var(--radius-sm);
-  margin-bottom: 6px;
-}
-.badge-tag.dark {
-  background: rgba(147,197,253,0.15);
-  color: var(--accent-soft);
-}
-.badge-text { font-size: 13px; color: var(--text-secondary); line-height: 1.5; }
-
-.cat-legend { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
-.cat-row {
-  display: grid;
-  grid-template-columns: 12px 1fr auto auto;
-  gap: 10px;
-  align-items: center;
-  font-size: 13px;
-}
 .cat-name { color: var(--text-secondary); }
-.cat-amt { font-family: 'JetBrains Mono', monospace; font-weight: 500; }
-.cat-pct { color: var(--text-tertiary); font-size: 12px; width: 36px; text-align: right; }
+.cat-amt { font-family: 'JetBrains Mono', monospace; font-weight: 500; font-size: 12px; }
 
-.accounts-row {
-  display: flex;
-  gap: 16px;
-  overflow-x: auto;
-  padding-bottom: 8px;
-}
-.mini-account-card {
-  flex-shrink: 0;
-  min-width: 200px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 16px;
-}
-.mini-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-.mini-name { font-size: 13px; font-weight: 500; }
-.mini-balance {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 18px;
-  font-weight: 500;
-  margin-bottom: 4px;
-}
-.mini-count { font-size: 12px; color: var(--text-tertiary); margin-bottom: 10px; }
-.ratio-bar {
-  height: 4px;
-  background: var(--accent-muted);
-  border-radius: 2px;
-  overflow: hidden;
-}
-.ratio-debit { height: 100%; background: var(--accent-primary); transition: width 600ms; }
-.ratio-labels {
-  display: flex;
-  justify-content: space-between;
-  font-size: 11px;
-  color: var(--text-tertiary);
-  margin-top: 6px;
-}
-
+/* INSIGHTS */
 .insights-panel {
   background: var(--bg-deep);
   color: var(--text-inverse);
   border-radius: var(--radius-lg);
   padding: 32px;
 }
+.insights-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
 .insights-header {
   font-family: 'DM Serif Display', serif;
-  font-size: 24px;
-  margin-bottom: 24px;
+  font-size: 22px;
 }
 .insights-grid {
   display: grid;
@@ -1565,7 +1618,7 @@ body { margin: 0; }
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
   color: var(--accent-soft);
   margin-bottom: 12px;
@@ -1573,21 +1626,45 @@ body { margin: 0; }
   letter-spacing: 0.06em;
 }
 .insight-item {
-  margin-bottom: 16px;
+  margin-bottom: 14px;
   padding-bottom: 12px;
   border-bottom: 1px solid rgba(147,197,253,0.1);
 }
-.insight-item:last-child { border-bottom: none; }
+.insight-item:last-child { border-bottom: none; padding-bottom: 0; }
 .insight-text { font-size: 13px; color: #cbd5e1; line-height: 1.5; margin-top: 6px; }
 
-.action-section { }
+.badge-tag {
+  display: inline-block;
+  background: var(--accent-muted);
+  color: var(--accent-primary);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+}
+.badge-tag.dark { background: rgba(147,197,253,0.15); color: var(--accent-soft); }
+
+.insights-empty {
+  text-align: center;
+  padding: 32px;
+}
+.insights-empty-text {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+}
+
+/* ACTION STEPS */
+.action-section {}
+.action-header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .action-header {
   font-family: 'DM Serif Display', serif;
   font-size: 22px;
-  margin-bottom: 16px;
 }
 .action-list { display: flex; flex-direction: column; gap: 10px; }
-.action-card {
+.action-step-card {
   display: grid;
   grid-template-columns: 36px 1fr auto;
   gap: 16px;
@@ -1598,12 +1675,8 @@ body { margin: 0; }
   padding: 16px 20px;
   transition: opacity 200ms;
 }
-.action-card.done { opacity: 0.55; }
-.action-num {
-  font-family: 'DM Serif Display', serif;
-  font-size: 22px;
-  color: var(--text-tertiary);
-}
+.action-step-card.done { opacity: 0.55; }
+.action-num { font-family: 'DM Serif Display', serif; font-size: 22px; color: var(--text-tertiary); }
 .action-title { font-size: 14px; font-weight: 500; margin-bottom: 2px; }
 .action-rationale { font-size: 13px; color: var(--text-secondary); }
 .action-right { display: flex; align-items: center; gap: 12px; }
@@ -1630,7 +1703,6 @@ body { margin: 0; }
   align-items: center;
   justify-content: center;
   color: white;
-  transition: all 150ms;
 }
 .checkbox.checked {
   background: var(--accent-primary);
@@ -1643,6 +1715,67 @@ body { margin: 0; }
   100% { transform: scale(1); }
 }
 
+/* MODAL */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(10,22,40,0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  animation: fadeUp 200ms ease;
+}
+.modal-card {
+  background: var(--bg-surface);
+  border-radius: var(--radius-xl);
+  max-width: 540px;
+  width: calc(100% - 48px);
+  max-height: 85vh;
+  overflow-y: auto;
+  padding: 28px;
+  box-shadow: var(--shadow-elevated);
+}
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 20px;
+}
+.modal-list { display: flex; flex-direction: column; gap: 10px; }
+.source-slot {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+}
+.source-slot.compact { padding: 10px 14px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.slot-center { flex: 1; min-width: 0; }
+.slot-name { font-size: 13px; font-weight: 500; }
+.slot-hint { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
+.slot-right { display: flex; align-items: center; gap: 8px; }
+.check-icon {
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--success); color: white;
+  display: flex; align-items: center; justify-content: center;
+}
+
+.modal-processing {
+  text-align: center;
+  padding: 32px 0;
+}
+.proc-ring-sm { display: inline-block; margin-bottom: 12px; }
+.proc-pct {
+  font-family: 'DM Serif Display', serif;
+  font-size: 32px;
+  margin-bottom: 4px;
+}
+.proc-msg { font-size: 13px; color: var(--text-secondary); }
+
+/* TOAST */
 .toast {
   position: fixed;
   bottom: 32px;
@@ -1655,14 +1788,18 @@ body { margin: 0; }
   font-size: 13px;
   box-shadow: var(--shadow-elevated);
   animation: fadeUp 220ms ease;
+  z-index: 200;
 }
 
-/* Responsive */
-@media (max-width: 768px) {
+/* RESPONSIVE */
+@media (max-width: 900px) {
+  .stats-strip { grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  .stat-divider { display: none; }
   .dash-grid { grid-template-columns: 1fr; }
-  .networth-card { grid-template-columns: 1fr; }
-  .insights-grid { grid-template-columns: 1fr; }
-  .big-number { font-size: 40px; }
-  .top-bar { flex-direction: column; gap: 12px; align-items: flex-start; }
+  .insights-grid { grid-template-columns: 1fr; gap: 20px; }
+  .app-body { padding: 24px 16px 64px; }
+  .top-bar { padding: 16px 20px; }
+  .ac-counterparty { font-size: 20px; }
+  .ac-amount { font-size: 22px; }
 }
 `;
